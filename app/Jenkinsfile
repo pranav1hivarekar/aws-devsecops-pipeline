@@ -1,0 +1,175 @@
+pipeline {
+  agent any
+
+  environment {
+	AWS_REGION = 'us-east-1'
+	REPO_NAME = 'ECR_REPO_NAME'
+	ECR_URI = 'ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com'
+	IMAGE_TAG = "v1.${BUILD_ID}"
+	DEPLOY_IP = 'YOUR_DEPLOY_IP'
+	GITHUB_REPO = 'YOUR_GITHUB_REPO'
+  }
+
+  stages {
+	stage('Checkout Git') {
+		steps {
+			git branch: 'main', credentialsId: '/jenkins/github_token', url: "$GITHUB_REPO"
+		}
+	}
+
+	stage("SCA") {
+		steps {
+			catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {  
+				sh "ls -la"
+				sh "docker run -v \$(pwd):/src --rm hysnsec/safety check -r /src/app/requirements.txt --json | tee sca-results.json"
+			}
+		}
+		post {
+			always {
+				archiveArtifacts artifacts: 'sca-results.json', fingerprint: true
+				}
+		}
+	}
+
+
+	stage("Secret Scanning") {
+		steps {
+			catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+				sh "ls -la"
+				sh "docker run -v \$(pwd):/src --rm trufflesecurity/trufflehog filesystem /src --json | tee trufflehog-output.json"
+			}
+		}
+		post {
+			always {
+				archiveArtifacts artifacts: 'trufflehog-output.json', fingerprint: true
+			}
+		}
+	}
+
+	stage("SAST") {
+		steps {
+			catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {  
+				sh "ls -la"
+				sh "docker run --user \$(id -u):\$(id -g) -v \$(pwd):/src --rm ghcr.io/pycqa/bandit/bandit -r /src -f json -o /src/bandit-output.json"
+			}
+		}
+		post {
+			always {
+				archiveArtifacts artifacts: 'bandit-output.json', fingerprint: true
+			}
+		}
+	}
+
+	stage("IaC Scanning") {
+		steps {
+			catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {    
+				sh "docker run --rm -w /src -v \$(pwd):/src bridgecrew/checkov -d /src/terraform -o json | tee checkov-output.json"
+			}
+		}
+		post {
+			always {
+				archiveArtifacts artifacts: 'checkov-output.json', fingerprint: true
+			}
+		}
+	}
+
+	stage('Build Docker Image') {
+		steps {
+			sh '''
+			aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_URI
+			docker build -t $ECR_URI/$REPO_NAME:$IMAGE_TAG ./app/
+			docker tag $ECR_URI/$REPO_NAME:$IMAGE_TAG $ECR_URI/$REPO_NAME:latest
+			'''
+		}
+	}
+
+	stage("Image Scanning") {
+		steps {
+			catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {  
+				sh "ls -la"
+				sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v \$(pwd):/result/ aquasec/trivy image --exit-code 1 -f json -o /result/trivy-report.json \$ECR_URI/\$REPO_NAME:\$IMAGE_TAG"
+			}
+		}
+		post {
+			always {
+				archiveArtifacts artifacts: 'trivy-report.json', fingerprint: true
+			}
+		}
+	}
+
+	stage('Push to ECR') {
+		steps {
+			sh '''
+			docker push $ECR_URI/$REPO_NAME:$IMAGE_TAG
+			docker push $ECR_URI/$REPO_NAME:latest
+			'''
+		}
+	}
+
+	stage("Ansible Hardening") {
+		steps {
+			catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') { 
+				withCredentials([sshUserPrivateKey(credentialsId: '/jenkins/deploy_ssh_key', keyFileVariable: 'DEPLOY_KEY')]) {
+					sh """
+					echo '[prod]' > inventory.ini
+					echo '${env.DEPLOY_IP}' >> inventory.ini
+
+					export PATH=$PATH:~/.local/bin
+					export ANSIBLE_HOST_KEY_CHECKING=False
+					
+					ansible-galaxy install dev-sec.ssh-hardening
+
+					cat <<EOF > ansible-hardening.yml
+---
+- name: Playbook to harden ubuntu ssh
+  hosts: prod
+  remote_user: ubuntu
+  become: yes
+
+  roles:
+    - dev-sec.ssh-hardening
+EOF
+					ansible-playbook -i inventory.ini ansible-hardening.yml --private-key \$DEPLOY_KEY
+					"""
+				}//with
+			}
+		}
+	}
+
+	stage('Deploy to EC2') {
+		steps {
+			withCredentials([sshUserPrivateKey(credentialsId: '/jenkins/deploy_ssh_key', keyFileVariable: 'DEPLOY_KEY')]) {
+				sh """
+				ssh -o StrictHostKeyChecking=no -i \$DEPLOY_KEY ubuntu@${env.DEPLOY_IP} \\
+				"
+				aws ecr get-login-password --region ${env.AWS_REGION} | docker login --username AWS --password-stdin ${env.ECR_URI} && \\
+				docker stop app || true && \\
+				docker rm app || true && \\
+				docker pull ${env.ECR_URI}/${env.REPO_NAME}:${env.IMAGE_TAG} && \\
+				docker run -d --name app -p 80:5000 ${env.ECR_URI}/${env.REPO_NAME}:${env.IMAGE_TAG}"
+				"""
+			}
+		}
+	}
+
+	stage("DAST") {
+		steps {
+			catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {    
+			sh "docker run -u root -v \$(pwd):/zap/wrk:rw --rm -t softwaresecurityproject/zap-stable:2.14.0 zap-baseline.py -t http://\${DEPLOY_IP} -J zap-output.json"
+			}
+		}
+		post {
+			always {
+				archiveArtifacts artifacts: 'zap-output.json', fingerprint: true
+			}
+		}
+	}
+
+}
+
+  post {
+	always {
+		sh 'rm -f /tmp/deploy-key.pem || true'
+	}
+  }
+}
