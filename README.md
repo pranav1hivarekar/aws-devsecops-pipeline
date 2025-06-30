@@ -25,9 +25,9 @@ I've structured this project around two core components: the AWS infrastructure 
 | Image Scanning | trivy | Scans the built Docker image for vulnerabilities |
 | Hardening | ansible | Remotely hardens the deployment server |
 | DAST | zap | Dynamic scan against running application |
-
-![JenkinsCICD-architecture](https://github.com/pranav1hivarekar/aws-devsecops-pipeline/blob/main/images/jenkinslandscape.cicd.png)
-
+<br /><br />
+<img src="https://github.com/pranav1hivarekar/aws-devsecops-pipeline/blob/main/images/jenkinslandscape.cicd.png" height="500">
+<br />
 
 ## Security & DevOps Principles in Action
 - **Principle of Least Privilege**: Used IAM Roles for both Jenkins and the deployment server granting minimal required permissions.
